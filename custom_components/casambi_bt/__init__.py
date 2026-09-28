@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import Final
 
+from bleak.exc import BleakError
 from CasambiBt import Casambi, Group, Scene, Unit, UnitControlType
 from CasambiBt.errors import AuthenticationError, BluetoothError, NetworkNotFoundError
 
@@ -25,6 +26,11 @@ from homeassistant.helpers.httpx_client import get_async_client
 from .const import DOMAIN, PLATFORMS
 
 _LOGGER: Final = logging.getLogger(__name__)
+
+# CasambiBt waits for handshake notifications without a timeout, so a link that
+# drops mid-handshake would otherwise hang forever while holding the reconnect lock.
+CONNECT_TIMEOUT: Final = 60
+RECONNECT_INTERVAL: Final = 30
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -78,7 +84,10 @@ class CasambiApi:
         self._callback_map: dict[int, list[Callable[[Unit], None]]] = {}
         self._cancel_bluetooth_callback: Callable[[], None] | None = None
         self._reconnect_lock = asyncio.Lock()
-        self._first_disconnect = True
+        self._reconnect_task: asyncio.Task[None] | None = None
+
+        self.casa.registerDisconnectCallback(self._casa_disconnect)
+        self.casa.registerUnitChangedHandler(self._unit_changed_handler)
 
     def _register_bluetooth_callback(self) -> None:
         self._cancel_bluetooth_callback = bluetooth.async_register_callback(
@@ -97,12 +106,19 @@ class CasambiApi:
             if not device:
                 raise NetworkNotFoundError  # noqa: TRY301
 
-            self.casa.registerDisconnectCallback(self._casa_disconnect)
-            self.casa.registerUnitChangedHandler(self._unit_changed_handler)
-
-            await self.casa.connect(device, self.password)
-            self._first_disconnect = True
-        except BluetoothError as err:
+            try:
+                async with asyncio.timeout(CONNECT_TIMEOUT):
+                    await self.casa.connect(device, self.password)
+            except Exception:
+                # CasambiBt leaves the GATT link open on most handshake failures,
+                # which blocks every later connection attempt to the controller.
+                await self.casa.disconnect()
+                raise
+        except TimeoutError as err:
+            raise ConfigEntryNotReady(
+                f"Timed out connecting to network {self.address}"
+            ) from err
+        except (BluetoothError, BleakError) as err:
             raise ConfigEntryNotReady("Failed to use bluetooth") from err
         except NetworkNotFoundError as err:
             raise ConfigEntryNotReady(
@@ -152,6 +168,10 @@ class CasambiApi:
 
     async def disconnect(self) -> None:
         """Disconnects from the controller and disables automatic reconnect."""
+        if self._reconnect_task is not None:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+
         async with self._reconnect_lock:
             if self._cancel_bluetooth_callback is not None:
                 self._cancel_bluetooth_callback()
@@ -169,28 +189,36 @@ class CasambiApi:
 
     @callback
     def _casa_disconnect(self) -> None:
-        if self._first_disconnect:
-            self._first_disconnect = False
-            self.conf_entry.async_create_background_task(
-                self.hass, self._delayed_reconnect(), "Delayed reconnect"
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = self.conf_entry.async_create_background_task(
+                self.hass, self._reconnect_until_connected(), "Casambi reconnect"
             )
 
-    async def _delayed_reconnect(self) -> None:
-        await asyncio.sleep(30)
-
-        async with self._reconnect_lock:
+    async def _reconnect_until_connected(self) -> None:
+        while not self.casa.connected:
+            await asyncio.sleep(RECONNECT_INTERVAL)
             if self.casa.connected:
                 return
 
-        _LOGGER.debug("Starting delayed reconnect.")
-        device = bluetooth.async_ble_device_from_address(self.hass, self.address)
-        if device is not None:
+            device = bluetooth.async_ble_device_from_address(
+                self.hass, self.address, connectable=True
+            )
+            if device is None:
+                _LOGGER.debug("Skipping reconnect. HA reports device not present.")
+                continue
+
+            _LOGGER.debug("Starting reconnect.")
             try:
                 await self.try_reconnect()
+            except ConfigEntryAuthFailed:
+                self.conf_entry.async_start_reauth(self.hass)
+                return
             except Exception:
-                _LOGGER.exception("Error during reconnect. This is not unusual.")
-        else:
-            _LOGGER.debug("Skipping reconnect. HA reports device not present.")
+                _LOGGER.warning(
+                    "Reconnect failed, retrying in %ss",
+                    RECONNECT_INTERVAL,
+                    exc_info=True,
+                )
 
     async def try_reconnect(self) -> None:
         """Attemtps to reconnect to the Casambi network. Disconnects first to ensure a consitent state."""
