@@ -195,7 +195,9 @@ class CasambiApi:
             )
 
     async def _reconnect_until_connected(self) -> None:
-        while not self.casa.connected:
+        # Runs eagerly from the library's disconnect callback, which fires before
+        # the client state is reset, so casa.connected is still True on entry.
+        while True:
             await asyncio.sleep(RECONNECT_INTERVAL)
             if self.casa.connected:
                 return
